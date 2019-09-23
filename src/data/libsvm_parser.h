@@ -83,6 +83,109 @@ std::ptrdiff_t IgnoreCommentAndBlank(char const* beg,
   return length;
 }
 
+
+/*
+ * <Line>    -> <Label> <Qid> <positive int>: <float> ... <positive int>: <float> <Comment>
+ * <Label>   -> <positive int> : <Weight> | <positive int>
+ * <Weight>  -> <float>
+ * <Qid>     -> qid : <positive int> | e
+ * <Comment> -> # <String> | e
+ */
+template <typename IndexType, typename DType>
+void ParseBlock(char* lbegin, char* end, RowBlockContainer<IndexType, DType> *out) {
+  enum class SVMParserState {
+    kLabel,
+    kQid,
+    kFeature,
+    kComment,
+  } state { SVMParserState::kLabel };
+
+  enum class HasField {
+    kUnknown,
+    kTrue,
+    kFalse
+  } has_weight { HasField::kUnknown }, has_qid { HasField::kUnknown };
+
+  IndexType min_feat_id = std::numeric_limits<IndexType>::max();
+  std::string const error_prefix {"libSVM Parser error: "};
+
+  while (true) {
+    const char * lend = lbegin;
+    const char * p = lbegin;
+    const char * q = NULL;
+    switch(state) {
+      case SVMParserState::kLabel: {
+        real_t label{0};
+        real_t weight{0};
+        auto r = ParsePair<real_t, real_t>(p, lend, &q, label, weight);
+        out->label.emplace_back(label);
+
+        if (r == 2) {
+          if (has_weight == HasField::kFalse) {
+            LOG(FATAL) << error_prefix << "Weight should be provided for all rows when used.";
+          }
+          if (has_weight == HasField::kUnknown) {
+            has_weight = HasField::kTrue;
+          }
+          out->weight.emplace_back(weight);
+        } else {
+          if (has_weight == HasField::kTrue) {
+            LOG(FATAL) << error_prefix << "Weight should be provided for all rows when used.";
+          }
+          if (has_weight == HasField::kUnknown) {
+            has_weight = HasField::kFalse;
+          }
+        }
+
+        state = SVMParserState::kQid;
+        break;
+      }
+      case SVMParserState::kQid: {
+        CHECK_NE(lbegin, end);
+        while (p != end && *p == ' ') ++p;
+        if (p == lend) { state = SVMParserState::kLabel; }
+        float qid{0};
+        if (strncmp(p, "qid:", 4) == 0) {
+          if (has_qid == HasField::kFalse) {
+            LOG(FATAL) << error_prefix << "Qid should be provided for all rows when used.";
+          }
+          p += 4;
+          qid = static_cast<uint64_t>(atoll(p));
+          while (p != lend && isdigitchars(*p)) ++p;
+          out->qid.push_back(qid);
+          has_qid = HasField::kTrue;
+        } else {
+          if (has_qid == HasField::kTrue) {
+            LOG(FATAL) << error_prefix << "Qid should be provided for all rows when used.";
+          }
+        }
+        break;
+      }
+      case SVMParserState::kFeature: {
+        if (out->label.size() != 0) {
+          out->offset.push_back(out->index.size());
+        }
+        while (*p != '\n' && *p != '#') {
+          IndexType feature {0};
+          DType value {0};
+          auto r = ParsePair<IndexType, real_t>(p, lend, &q, feature, value);
+          CHECK_EQ(r, 2) << error_prefix << "Found in-complete feature:value pair.";
+          out->index.emplace_back(feature);
+          out->value.emplace_back(value);
+        }
+        state = SVMParserState::kComment;
+        break;
+      }
+      case SVMParserState::kComment: {
+        std::ptrdiff_t advanced { IgnoreCommentAndBlank(p, lend) };
+        p += advanced;
+        state = SVMParserState::kFeature;
+        break;
+      }
+    }
+  }
+}
+
 template <typename IndexType, typename DType>
 void LibSVMParser<IndexType, DType>::
 ParseBlock(const char *begin,
@@ -92,6 +195,7 @@ ParseBlock(const char *begin,
   const char * lbegin = begin;
   const char * lend = lbegin;
   IndexType min_feat_id = std::numeric_limits<IndexType>::max();
+
   while (lbegin != end) {
     // get line end
     lend = lbegin + 1;
